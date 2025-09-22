@@ -1,0 +1,292 @@
+blueprint:
+  name: Motion→Light mit Timer, Lux‑Hysterese & Manual‑Hold (mit Hold‑Failsafe)
+  description: >
+    Schaltet ein Licht bei Bewegung abhängig von Helligkeit, hält es via Timer an,
+    retriggert bei weiterer Bewegung und schaltet aus, wenn der Timer abläuft und keine Bewegung mehr anliegt.
+    Lux‑Hysterese verhindert Flattern; Manual‑Hold setzt die Automatik außer Kraft.
+    OPTIONAL: Trotz Hold nach einstellbarer Inaktivitätsdauer automatisch ausschalten (Failsafe).
+  domain: automation
+  input:
+    motion_sensor:
+      name: Bewegungsmelder
+      selector:
+        entity:
+          domain: binary_sensor
+          device_class: motion
+    light_target:
+      name: Licht (Entity oder Gruppe)
+      selector:
+        entity:
+          domain: light
+    illuminance_sensor:
+      name: Helligkeitssensor (Lux)
+      selector:
+        entity:
+          domain: sensor
+    cutoff_lux:
+      name: Lux‑Schwelle (einschalten)
+      default: 25
+      selector:
+        number:
+          min: 0
+          max: 2000
+          step: 1
+          mode: box
+          unit_of_measurement: lx
+    hysteresis_lux:
+      name: Hysterese (±lx)
+      default: 5
+      selector:
+        number:
+          min: 0
+          max: 200
+          step: 1
+          mode: box
+          unit_of_measurement: lx
+    delay_minutes:
+      name: Nachlaufzeit (Minuten)
+      default: 3
+      selector:
+        number:
+          min: 0.1
+          max: 240
+          step: 0.1
+          mode: box
+          unit_of_measurement: min
+    timer_entity:
+      name: Timer
+      selector:
+        entity:
+          domain: timer
+    hold_boolean:
+      name: Manual‑Hold (input_boolean)
+      selector:
+        entity:
+          domain: input_boolean
+    dark_helper:
+      name: Dunkel‑Status (input_boolean)
+      selector:
+        entity:
+          domain: input_boolean
+    debug:
+      name: Debug‑Logs aktiv
+      default: false
+      selector:
+        boolean: {}
+
+    # --- NEU: Failsafe-Optionen ---
+    hold_failsafe_enabled:
+      name: Auto‑Off trotz aktiviertem Hold
+      description: Wenn an, wird trotz Hold ausgeschaltet, wenn für X Zeit keine Bewegung erkannt wurde.
+      default: true
+      selector:
+        boolean: {}
+    hold_inactivity:
+      name: Inaktivitätsdauer für Auto‑Off bei Hold
+      description: Zeit ohne Bewegung, nach der trotz Hold ausgeschaltet wird
+      default: "00:30:00"
+      selector:
+        duration: {}
+    release_hold_on_failsafe:
+      name: Hold nach Auto‑Off wieder ausschalten
+      default: true
+      selector:
+        boolean: {}
+
+mode: queued
+max: 10
+
+variables:
+  motion_sensor: !input motion_sensor
+  light_target: !input light_target
+  illuminance_sensor: !input illuminance_sensor
+  cutoff_lux: !input cutoff_lux
+  hysteresis_lux: !input hysteresis_lux
+  delay_minutes: !input delay_minutes
+  timer_entity: !input timer_entity
+  hold_boolean: !input hold_boolean
+  dark_helper: !input dark_helper
+  debug: !input debug
+  hold_failsafe_enabled: !input hold_failsafe_enabled
+  release_hold_on_failsafe: !input release_hold_on_failsafe
+
+trigger:
+  - id: motion_on
+    platform: state
+    entity_id: !input motion_sensor
+    to: "on"
+
+  - id: timer_active
+    platform: state
+    entity_id: !input timer_entity
+    to: "active"
+
+  - id: timer_idle
+    platform: state
+    entity_id: !input timer_entity
+    to: "idle"
+
+  # --- NEU: Failsafe-Trigger (keine Bewegung für X) ---
+  - id: hold_failsafe
+    platform: state
+    entity_id: !input motion_sensor
+    to: "off"
+    for: !input hold_inactivity
+
+action:
+  - choose:
+
+      # --- D) NEU: Auto-Off trotz Hold nach Inaktivität ---
+      - conditions:
+          - condition: trigger
+            id: hold_failsafe
+          - condition: template
+            value_template: "{{ hold_failsafe_enabled }}"
+          - condition: state
+            entity_id: !input hold_boolean
+            state: "on"
+          - condition: state
+            entity_id: !input light_target
+            state: "on"
+        sequence:
+          - service: timer.cancel
+            target: { entity_id: !input timer_entity }
+          - service: light.turn_off
+            target: { entity_id: !input light_target }
+          - if:
+              - condition: template
+                value_template: "{{ release_hold_on_failsafe }}"
+            then:
+              - service: input_boolean.turn_off
+                target: { entity_id: !input hold_boolean }
+          - if:
+              - condition: template
+                value_template: "{{ debug }}"
+            then:
+              - service: logbook.log
+                data:
+                  name: Motion Failsafe
+                  message: "{{ light_target }}: Auto-Off trotz Hold (Inaktivität erreicht)"
+                  entity_id: !input light_target
+
+      # --- A) Bewegung erkannt ---
+      - conditions:
+          - condition: trigger
+            id: motion_on
+        sequence:
+          - variables:
+              lux: "{{ states(illuminance_sensor) | float(99999) }}"
+              low: "{{ (cutoff_lux | float(0)) - (hysteresis_lux | float(0)) }}"
+              high: "{{ (cutoff_lux | float(0)) + (hysteresis_lux | float(0)) }}"
+              was_dark: "{{ is_state(dark_helper, 'on') }}"
+              duration_seconds: "{{ ((delay_minutes | float(1)) * 60) | int }}"
+
+          # Hysterese-Status setzen
+          - choose:
+              - conditions:
+                  - condition: template
+                    value_template: >
+                      {% set lux = states(illuminance_sensor) | float(99999) %}
+                      {% set low = (cutoff_lux | float(0)) - (hysteresis_lux | float(0)) %}
+                      {% set high = (cutoff_lux | float(0)) + (hysteresis_lux | float(0)) %}
+                      {% set was_dark = is_state(dark_helper, 'on') %}
+                      {{ (was_dark and (lux < high)) or ((not was_dark) and (lux < low)) }}
+                sequence:
+                  - service: input_boolean.turn_on
+                    target: { entity_id: !input dark_helper }
+            default:
+              - service: input_boolean.turn_off
+                target: { entity_id: !input dark_helper }
+
+          # Trigger-Regel: kein Hold + (Licht schon an ODER dunkel genug)
+          - choose:
+              - conditions:
+                  - condition: state
+                    entity_id: !input hold_boolean
+                    state: "off"
+                  - condition: or
+                    conditions:
+                      - condition: state
+                        entity_id: !input light_target
+                        state: "on"
+                      - condition: state
+                        entity_id: !input dark_helper
+                        state: "on"
+                sequence:
+                  - service: timer.start
+                    target: { entity_id: !input timer_entity }
+                    data:
+                      duration: "{{ duration_seconds }}"
+                  - if:
+                      - condition: template
+                        value_template: "{{ debug }}"
+                    then:
+                      - service: logbook.log
+                        data:
+                          name: Motion Timer
+                          message: >
+                            {{ light_target }} retrigger:
+                            Bewegung erkannt (lux={{ states(illuminance_sensor) | float(0) }} lx),
+                            Timer {{ duration_seconds }}s
+                          entity_id: !input light_target
+
+      # --- B) Timer wurde aktiv -> Licht an ---
+      - conditions:
+          - condition: trigger
+            id: timer_active
+        sequence:
+          - service: light.turn_on
+            target: { entity_id: !input light_target }
+          - if:
+              - condition: template
+                value_template: "{{ debug }}"
+            then:
+              - service: logbook.log
+                data:
+                  name: Motion Timer
+                  message: "{{ light_target }}: Timer active → Licht an"
+                  entity_id: !input light_target
+
+      # --- C) Timer abgelaufen ---
+      - conditions:
+          - condition: trigger
+            id: timer_idle
+        sequence:
+          - choose:
+              - conditions:
+                  - condition: state
+                    entity_id: !input hold_boolean
+                    state: "on"
+                sequence: []
+              - conditions:
+                  - condition: state
+                    entity_id: !input motion_sensor
+                    state: "on"
+                sequence:
+                  - variables:
+                      duration_seconds: "{{ ((delay_minutes | float(1)) * 60) | int }}"
+                  - service: timer.start
+                    target: { entity_id: !input timer_entity }
+                    data:
+                      duration: "{{ duration_seconds }}"
+                  - if:
+                      - condition: template
+                        value_template: "{{ debug }}"
+                    then:
+                      - service: logbook.log
+                        data:
+                          name: Motion Timer
+                          message: "{{ light_target }}: Timer idle, aber Bewegung → Timer neu gestartet"
+                          entity_id: !input light_target
+            default:
+              - service: light.turn_off
+                target: { entity_id: !input light_target }
+              - if:
+                  - condition: template
+                    value_template: "{{ debug }}"
+                then:
+                  - service: logbook.log
+                    data:
+                      name: Motion Timer
+                      message: "{{ light_target }}: Timer idle & keine Bewegung → Licht aus"
+                      entity_id: !input light_target
