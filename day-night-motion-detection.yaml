@@ -1,0 +1,345 @@
+blueprint:
+  name: "Tag/Nacht Bewegungsmelder mit Zuschalttaster & Manual‑Hold"
+  description: >
+    Bewegung schaltet zeitabhängig ein Licht ein: tagsüber das Tag‑Licht,
+    nachts das Nacht‑Licht. Der physische Taster schaltet das jeweils andere
+    Licht DAZU (z.B. nachts Bewegung → Spiegel an, Taster → Decke dazu).
+    Erneutes Drücken schaltet das zugeschaltete Licht wieder aus.
+    Sowohl Bewegung als auch Tasterdruck setzen den Abschalttimer zurück.
+    Bei Timer‑Ablauf wird nur ausgeschaltet, wenn keine Bewegung mehr anliegt.
+
+    Manual‑Hold (input_boolean) verhindert automatisches Ausschalten und wird
+    über das HA‑Dashboard, einen Sprachassistenten oder eine separate Automation
+    gesteuert — nicht über den physischen Taster, da dieser für das Zuschalten
+    belegt ist. Failsafe schaltet trotz Hold nach konfigurierbarer Inaktivität aus.
+
+    Benötigte Helfer‑Entitäten (manuell anlegen):
+      - input_number  →  Nacht‑Modus Beginn (Stunde 0–23, z.B. 22)
+      - input_number  →  Nacht‑Modus Dauer  (Stunden 1–12, z.B. 8)
+      - input_boolean →  Manual‑Hold
+      - timer         →  Nachlauf‑Timer
+  domain: automation
+  input:
+    # --- Geräte ---
+    motion_sensor:
+      name: Bewegungsmelder
+      selector:
+        entity:
+          domain: binary_sensor
+    light_day:
+      name: Licht Tag‑Modus
+      description: "Wird bei Bewegung tagsüber eingeschaltet, nachts per Taster zugeschaltet"
+      selector:
+        entity:
+          domain: light
+    light_night:
+      name: Licht Nacht‑Modus
+      description: "Wird bei Bewegung nachts eingeschaltet, tagsüber per Taster zugeschaltet"
+      selector:
+        entity:
+          domain: light
+    switch_entity:
+      name: Zuschalttaster
+      description: "Schaltet das jeweils andere Licht dazu (toggle)"
+      selector:
+        entity:
+          domain: binary_sensor
+
+    # --- Timer & Nachlauf ---
+    timer_entity:
+      name: Timer
+      selector:
+        entity:
+          domain: timer
+    delay_minutes:
+      name: Nachlaufzeit (Minuten)
+      default: 5
+      selector:
+        number:
+          min: 0.5
+          max: 60
+          step: 0.5
+          mode: box
+          unit_of_measurement: min
+
+    # --- Tag/Nacht‑Helfer ---
+    night_start_hour:
+      name: "Nacht‑Modus Beginn (input_number: Stunde 0–23)"
+      selector:
+        entity:
+          domain: input_number
+    night_duration_hours:
+      name: "Nacht‑Modus Dauer (input_number: Stunden)"
+      selector:
+        entity:
+          domain: input_number
+
+    # --- Hold (gesteuert via Dashboard/Sprachassistent) ---
+    hold_boolean:
+      name: Manual‑Hold (input_boolean)
+      description: >
+        Verhindert automatisches Ausschalten. Steuerung über HA‑Dashboard
+        oder Sprachassistent, da der Taster für das Zuschalten belegt ist.
+      selector:
+        entity:
+          domain: input_boolean
+
+    # --- Failsafe ---
+    hold_failsafe_enabled:
+      name: Auto‑Off trotz aktiviertem Hold
+      description: >
+        Wenn an, wird trotz Hold ausgeschaltet, wenn für die
+        eingestellte Inaktivitätsdauer keine Bewegung erkannt wurde.
+      default: true
+      selector:
+        boolean: {}
+    hold_inactivity:
+      name: Inaktivitätsdauer für Auto‑Off bei Hold
+      default: "00:30:00"
+      selector:
+        duration: {}
+    release_hold_on_failsafe:
+      name: Hold nach Auto‑Off wieder ausschalten
+      default: true
+      selector:
+        boolean: {}
+
+    # --- Debug ---
+    debug:
+      name: Debug‑Logs aktiv
+      default: false
+      selector:
+        boolean: {}
+
+mode: queued
+max: 10
+
+variables:
+  motion_sensor: !input motion_sensor
+  light_day: !input light_day
+  light_night: !input light_night
+  switch_entity: !input switch_entity
+  timer_entity: !input timer_entity
+  delay_minutes: !input delay_minutes
+  night_start_hour: !input night_start_hour
+  night_duration_hours: !input night_duration_hours
+  hold_boolean: !input hold_boolean
+  debug: !input debug
+  hold_failsafe_enabled: !input hold_failsafe_enabled
+  release_hold_on_failsafe: !input release_hold_on_failsafe
+  is_night: >
+    {% set h = now().hour %}
+    {% set start = states(night_start_hour) | int(22) %}
+    {% set dur = states(night_duration_hours) | int(8) %}
+    {% set end_h = (start + dur) % 24 %}
+    {% if start >= end_h %}
+      {{ h >= start or h < end_h }}
+    {% else %}
+      {{ h >= start and h < end_h }}
+    {% endif %}
+  active_light: "{{ light_night if is_night else light_day }}"
+  inactive_light: "{{ light_day if is_night else light_night }}"
+  duration_seconds: "{{ ((delay_minutes | float(5)) * 60) | int }}"
+
+trigger:
+  - id: motion_on
+    platform: state
+    entity_id: !input motion_sensor
+    to: "on"
+
+  - id: timer_idle
+    platform: state
+    entity_id: !input timer_entity
+    to: "idle"
+
+  - id: switch_pressed
+    platform: state
+    entity_id: !input switch_entity
+
+  - id: hold_failsafe
+    platform: state
+    entity_id: !input motion_sensor
+    to: "off"
+    for: !input hold_inactivity
+
+action:
+  - choose:
+
+      # ──────────────────────────────────────────────
+      # A) Failsafe: Auto‑Off trotz Hold nach Inaktivität
+      # ──────────────────────────────────────────────
+      - conditions:
+          - condition: trigger
+            id: hold_failsafe
+          - condition: template
+            value_template: "{{ hold_failsafe_enabled }}"
+          - condition: state
+            entity_id: !input hold_boolean
+            state: "on"
+          - condition: or
+            conditions:
+              - condition: state
+                entity_id: !input light_day
+                state: "on"
+              - condition: state
+                entity_id: !input light_night
+                state: "on"
+        sequence:
+          - service: timer.cancel
+            target: { entity_id: !input timer_entity }
+          - service: light.turn_off
+            target: { entity_id: !input light_day }
+          - service: light.turn_off
+            target: { entity_id: !input light_night }
+          - if:
+              - condition: template
+                value_template: "{{ release_hold_on_failsafe }}"
+            then:
+              - service: input_boolean.turn_off
+                target: { entity_id: !input hold_boolean }
+          - if:
+              - condition: template
+                value_template: "{{ debug }}"
+            then:
+              - service: logbook.log
+                data:
+                  name: "Tag/Nacht Motion"
+                  message: "Auto‑Off trotz Hold (Inaktivität erreicht)"
+                  entity_id: "{{ active_light }}"
+
+      # ──────────────────────────────────────────────
+      # B) Bewegung erkannt → aktives Licht ein, Timer starten
+      #    Das inaktive Licht wird NICHT ausgeschaltet, falls
+      #    es vom Taster zugeschaltet wurde.
+      # ──────────────────────────────────────────────
+      - conditions:
+          - condition: trigger
+            id: motion_on
+          - condition: state
+            entity_id: !input hold_boolean
+            state: "off"
+        sequence:
+          - service: light.turn_on
+            target:
+              entity_id: "{{ active_light }}"
+          - service: timer.start
+            target: { entity_id: !input timer_entity }
+            data:
+              duration: "{{ duration_seconds }}"
+          - if:
+              - condition: template
+                value_template: "{{ debug }}"
+            then:
+              - service: logbook.log
+                data:
+                  name: "Tag/Nacht Motion"
+                  message: >
+                    Bewegung → {{ active_light }} an
+                    ({{ 'Nacht' if is_night else 'Tag' }}‑Modus, Timer {{ duration_seconds }}s)
+                  entity_id: "{{ active_light }}"
+
+      # ──────────────────────────────────────────────
+      # C) Timer abgelaufen → Licht aus (wenn kein Hold/Bewegung)
+      # ──────────────────────────────────────────────
+      - conditions:
+          - condition: trigger
+            id: timer_idle
+        sequence:
+          - choose:
+              # Hold aktiv → nichts tun
+              - conditions:
+                  - condition: state
+                    entity_id: !input hold_boolean
+                    state: "on"
+                sequence:
+                  - if:
+                      - condition: template
+                        value_template: "{{ debug }}"
+                    then:
+                      - service: logbook.log
+                        data:
+                          name: "Tag/Nacht Motion"
+                          message: "Timer idle, Hold aktiv → Licht bleibt an"
+                          entity_id: "{{ active_light }}"
+
+              # Bewegung noch erkannt → Timer neu starten
+              - conditions:
+                  - condition: state
+                    entity_id: !input motion_sensor
+                    state: "on"
+                sequence:
+                  - service: timer.start
+                    target: { entity_id: !input timer_entity }
+                    data:
+                      duration: "{{ duration_seconds }}"
+                  - if:
+                      - condition: template
+                        value_template: "{{ debug }}"
+                    then:
+                      - service: logbook.log
+                        data:
+                          name: "Tag/Nacht Motion"
+                          message: "Timer idle, aber Bewegung → Timer neu gestartet"
+                          entity_id: "{{ active_light }}"
+
+            # Keine Bewegung, kein Hold → ALLE Lichter aus
+            default:
+              - service: light.turn_off
+                target: { entity_id: !input light_day }
+              - service: light.turn_off
+                target: { entity_id: !input light_night }
+              - if:
+                  - condition: template
+                    value_template: "{{ debug }}"
+                then:
+                  - service: logbook.log
+                    data:
+                      name: "Tag/Nacht Motion"
+                      message: "Timer idle, keine Bewegung → alle Lichter aus"
+                      entity_id: "{{ active_light }}"
+
+      # ──────────────────────────────────────────────
+      # D) Taster → das jeweils ANDERE Licht dazu‑/abschalten
+      #    Bewegung schaltet active_light, Taster schaltet inactive_light.
+      #    Tasterdruck setzt immer den Timer zurück.
+      #    Funktioniert auch bei aktivem Hold.
+      # ──────────────────────────────────────────────
+      - conditions:
+          - condition: trigger
+            id: switch_pressed
+        sequence:
+          - service: light.toggle
+            target:
+              entity_id: "{{ inactive_light }}"
+
+          # Timer zurücksetzen, solange irgendein Licht an ist
+          - if:
+              - condition: or
+                conditions:
+                  - condition: state
+                    entity_id: !input light_day
+                    state: "on"
+                  - condition: state
+                    entity_id: !input light_night
+                    state: "on"
+            then:
+              - service: timer.start
+                target: { entity_id: !input timer_entity }
+                data:
+                  duration: "{{ duration_seconds }}"
+            # Alle Lichter aus → Timer stoppen
+            else:
+              - service: timer.cancel
+                target: { entity_id: !input timer_entity }
+
+          - if:
+              - condition: template
+                value_template: "{{ debug }}"
+            then:
+              - service: logbook.log
+                data:
+                  name: "Tag/Nacht Motion"
+                  message: >
+                    Taster → {{ inactive_light }} toggle
+                    ({{ 'Nacht' if is_night else 'Tag' }}‑Modus)
+                  entity_id: "{{ inactive_light }}"
